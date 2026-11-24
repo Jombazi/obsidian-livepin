@@ -50,7 +50,8 @@ function pinUrl(text, back, img) {
     "&x-success=" + encodeURIComponent(back);
 }
 
-const THUMB = 200; // px, longest side
+const THUMB = 160; // px, longest side
+const MAX_PREPARED = 5; // images per note thumbnailed ahead of time
 
 /** Base64 JPEG thumbnail of a vault image, or null if it can't be decoded. */
 async function thumbnail(bytes, ext) {
@@ -102,6 +103,9 @@ class LivePinPlugin extends Plugin {
     const data = (await this.loadData()) || {};
     this.pins = prune(data.pins || {}, Date.now());
     this.buttons = new Map(); // MarkdownView -> header button
+    // Thumbnails are made ahead of time: iOS only lets Obsidian open LivePin straight after a tap,
+    // and decoding a photo after the tap took too long, so the image pin silently did nothing.
+    this.thumbs = new Map(); // "path:mtime" -> base64 JPEG (or null if it can't be decoded)
 
     this.addCommand({
       id: "pin-note",
@@ -137,6 +141,18 @@ class LivePinPlugin extends Plugin {
 
     // One-tap pin button in every note's header; highlighted while the note is pinned.
     const refresh = () => this.refreshButtons();
+    const prepareActive = () => {
+      const file = this.app.workspace.getActiveFile();
+      if (file && file.extension === "md") this.prepare(file);
+    };
+    this.app.workspace.onLayoutReady(prepareActive);
+    this.registerEvent(this.app.workspace.on("file-open", prepareActive));
+    let timer = null;
+    this.registerEvent(this.app.vault.on("modify", (file) => {
+      if (file !== this.app.workspace.getActiveFile()) return;
+      window.clearTimeout(timer);
+      timer = window.setTimeout(prepareActive, 1500);
+    }));
     this.app.workspace.onLayoutReady(refresh);
     this.registerEvent(this.app.workspace.on("layout-change", refresh));
     this.registerEvent(this.app.workspace.on("file-open", refresh));
@@ -197,27 +213,50 @@ class LivePinPlugin extends Plugin {
     this.send(view.file, view.editor ? view.editor.getValue() : view.data, selection);
   }
 
-  async send(file, content, selection) {
+  /** Runs straight after the tap, without waiting, so iOS lets Obsidian open LivePin. */
+  send(file, content, selection) {
     const source = selection.trim() ? selection : content;
     const text = noteText(file.basename, stripImages(source));
-    const img = await this.image(file, source);
+    const img = this.preparedImage(file, source);
     if (!this.open(pinUrl(text, this.back(file.path), img))) return;
     this.pins[file.path] = Date.now();
     this.save();
     this.refreshButtons();
   }
 
-  /** Thumbnail of the first image embedded in `text`, as base64 JPEG. */
-  async image(file, text) {
+  key(target) {
+    return target.path + ":" + target.stat.mtime;
+  }
+
+  /** Ready-made thumbnail of the first image in `text`, or null if it isn't ready yet. */
+  preparedImage(file, text) {
     const link = firstImageLink(text);
-    if (!link || !Platform.isIosApp) return null;
-    const target = this.app.metadataCache.getFirstLinkpathDest(link, file.path);
+    const target = link && this.app.metadataCache.getFirstLinkpathDest(link, file.path);
     if (!target) return null;
-    try {
-      return await thumbnail(await this.app.vault.readBinary(target), target.extension);
-    } catch (e) {
-      return null;
+    const thumb = this.thumbs.get(this.key(target));
+    if (thumb === undefined) this.prepare(file); // ready for the next tap
+    return thumb || null;
+  }
+
+  /** Makes thumbnails for the first few images in a note, in the background. */
+  async prepare(file) {
+    if (!Platform.isIosApp) return;
+    let text;
+    try { text = await this.app.vault.cachedRead(file); } catch (e) { return; }
+    const links = [];
+    let rest = text;
+    for (let link; links.length < MAX_PREPARED && (link = firstImageLink(rest)); ) {
+      links.push(link);
+      rest = rest.split(link).slice(1).join(link); // continue after this embed
     }
+    for (const link of links) {
+      const target = this.app.metadataCache.getFirstLinkpathDest(link, file.path);
+      if (!target || this.thumbs.has(this.key(target))) continue;
+      let thumb = null;
+      try { thumb = await thumbnail(await this.app.vault.readBinary(target), target.extension); } catch (e) { /* none */ }
+      this.thumbs.set(this.key(target), thumb);
+    }
+    if (this.thumbs.size > 200) this.thumbs.clear();
   }
 
   back(path) {
