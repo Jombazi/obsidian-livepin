@@ -1,0 +1,9 @@
+{
+  "id": "livepin",
+  "name": "LivePin",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "Pin the current note or selection to the iPhone Lock Screen as a Live Activity through the LivePin app.",
+  "author": "Jombazi",
+  "isDesktopOnly": false
+}
